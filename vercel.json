@@ -1,0 +1,8 @@
+{
+  "fluid": true,
+  "functions": {
+    "pages/api/proxy.ts": {
+      "maxDuration": 300
+    }
+  }
+}
