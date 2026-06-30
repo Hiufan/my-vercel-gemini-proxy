@@ -26,7 +26,9 @@ export async function handleRequest(context: Context) {
     pathname.startsWith('/api/v1') ||
     pathname.startsWith('/api/v1beta') ||
     pathname.startsWith('/v1') ||
-    pathname.startsWith('/v1beta')
+    pathname.startsWith('/v1beta') ||
+    pathname.startsWith('/upload/v1') ||
+    pathname.startsWith('/upload/v1beta')
 
   if (!hasApiKey || !isGeminiPath) {
     return createErrorResponse('No permission', 401)
