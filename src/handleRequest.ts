@@ -227,5 +227,15 @@ export async function handleRequest(context: Context) {
     })
 
   logger.response.info('proxy stream start.')
-  return new Response(responseStream.readable, { status: 200, statusText: 'ok', headers })
+  const responseHeaders = new Headers()
+  responseHeaders.set('Content-Type', 'text/event-stream; charset=utf-8')
+  responseHeaders.set('Cache-Control', 'no-cache, no-transform')
+  responseHeaders.set('Connection', 'keep-alive')
+  responseHeaders.set('X-Accel-Buffering', 'no')
+  
+  return new Response(responseStream.readable, {
+  status: 200,
+  statusText: 'ok',
+  headers: responseHeaders,
+  })
 }
