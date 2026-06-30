@@ -5,17 +5,38 @@ import proxy from '@/index'
 export const config = {
   api: {
     bodyParser: false,
+    externalResolver: true,
     responseLimit: false,
   },
   maxDuration: 300,
 }
 
+function getRewrittenPath(req: NextApiRequest) {
+  const path = req.query._path
+
+  if (Array.isArray(path)) {
+    return `/${path.join('/')}`
+  }
+
+  if (typeof path === 'string' && path.length > 0) {
+    return `/${path}`
+  }
+
+  return undefined
+}
+
 function getRequestUrl(req: NextApiRequest) {
   const host = req.headers.host ?? 'localhost'
   const protocol = req.headers['x-forwarded-proto'] ?? 'https'
-  const rawUrl = req.url ?? '/'
+  const requestUrl = new URL(req.url ?? '/', `${protocol}://${host}`)
+  const rewrittenPath = getRewrittenPath(req)
 
-  return `${protocol}://${host}${rawUrl}`
+  if (rewrittenPath) {
+    requestUrl.pathname = rewrittenPath
+    requestUrl.searchParams.delete('_path')
+  }
+
+  return requestUrl.toString()
 }
 
 function getRequestHeaders(req: NextApiRequest) {
