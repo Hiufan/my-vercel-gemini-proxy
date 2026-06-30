@@ -32,7 +32,11 @@ export async function handleRequest(context: Context) {
   // otherwise it is definitely not a request to gemini,
   // and it must contain a token,
   // otherwise it definitely does not have permission.
-  if (!searchParams.has('key') || !(pathname.startsWith('/api/v1') || pathname.startsWith('/api/v1beta'))) {
+  const apiKeyFromQuery = searchParams.get('key')
+  const apiKeyFromHeader = request.headers.get('x-goog-api-key')
+  const hasApiKey = Boolean(apiKeyFromQuery || apiKeyFromHeader)
+  
+  if (!hasApiKey || !(pathname.startsWith('/api/v1') || pathname.startsWith('/api/v1beta'))) {
     return createErrorResponse('No permission', 401)
   }
 
