@@ -1,6 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from 'next'
 
-import proxy from '@/index'
+import { GOOGLE_GEMINI_API_URL } from '@/constants/conf'
+
+const GOOGLE_ORIGIN = new URL(GOOGLE_GEMINI_API_URL).origin
 
 export const config = {
   api: {
@@ -9,6 +11,24 @@ export const config = {
     responseLimit: false,
   },
   maxDuration: 300,
+}
+
+function isAllowedGeminiPath(pathname: string) {
+  return (
+    pathname.startsWith('/api/v1') ||
+    pathname.startsWith('/api/v1beta') ||
+    pathname.startsWith('/v1') ||
+    pathname.startsWith('/v1beta') ||
+    pathname.startsWith('/upload/v1') ||
+    pathname.startsWith('/upload/v1beta') ||
+    pathname === '/files' ||
+    pathname.startsWith('/files/') ||
+    pathname.startsWith('/files:')
+  )
+}
+
+function getProxyPath(pathname: string) {
+  return pathname.startsWith('/api/') ? pathname.replace(/^\/api/, '') : pathname
 }
 
 function getRewrittenPath(req: NextApiRequest) {
@@ -36,14 +56,37 @@ function getRequestUrl(req: NextApiRequest) {
     requestUrl.searchParams.delete('_path')
   }
 
-  return requestUrl.toString()
+  return requestUrl
 }
 
-function getRequestHeaders(req: NextApiRequest) {
-  const headers = new Headers()
+function getHeader(req: NextApiRequest, key: string) {
+  const value = req.headers[key.toLowerCase()]
+
+  if (Array.isArray(value)) {
+    return value[0]
+  }
+
+  return value
+}
+
+function appendForwardHeaders(req: NextApiRequest, headers: Headers) {
+  const allowedHeaders = [
+    'content-type',
+    'content-length',
+    'x-goog-api-client',
+    'x-goog-api-key',
+  ]
+
+  for (const key of allowedHeaders) {
+    const value = getHeader(req, key)
+
+    if (value) {
+      headers.set(key, value)
+    }
+  }
 
   for (const [key, value] of Object.entries(req.headers)) {
-    if (value === undefined) {
+    if (!key.startsWith('x-goog-upload-') || value === undefined) {
       continue
     }
 
@@ -56,35 +99,63 @@ function getRequestHeaders(req: NextApiRequest) {
 
     headers.set(key, value)
   }
-
-  return headers
 }
 
-function createWebRequest(req: NextApiRequest) {
-  const method = req.method ?? 'GET'
+function getGoogleUrl(req: NextApiRequest) {
+  const requestUrl = getRequestUrl(req)
+  const proxyPath = getProxyPath(requestUrl.pathname)
+  const googleUrl = new URL(proxyPath, GOOGLE_GEMINI_API_URL)
 
-  return new Request(getRequestUrl(req), {
-    method,
-    headers: getRequestHeaders(req),
-    body: method === 'GET' || method === 'HEAD' ? undefined : req,
-    duplex: 'half',
-  } as RequestInit & { duplex: 'half' })
-}
-
-async function sendWebResponse(webResponse: Response, res: NextApiResponse) {
-  res.statusCode = webResponse.status
-  res.statusMessage = webResponse.statusText
-
-  webResponse.headers.forEach((value, key) => {
-    res.setHeader(key, value)
+  requestUrl.searchParams.delete('_path')
+  requestUrl.searchParams.forEach((value, key) => {
+    googleUrl.searchParams.append(key, value)
   })
 
-  if (!webResponse.body) {
+  const apiKeyFromHeader = getHeader(req, 'x-goog-api-key')
+
+  if (!googleUrl.searchParams.has('key') && apiKeyFromHeader) {
+    googleUrl.searchParams.set('key', apiKeyFromHeader)
+  }
+
+  return { googleUrl, requestUrl }
+}
+
+function rewriteUploadUrl(value: string, requestUrl: URL) {
+  try {
+    const uploadUrl = new URL(value)
+
+    if (uploadUrl.origin !== GOOGLE_ORIGIN) {
+      return value
+    }
+
+    return `${requestUrl.origin}${uploadUrl.pathname}${uploadUrl.search}`
+  } catch {
+    return value
+  }
+}
+
+function sendResponseHeaders(response: Response, requestUrl: URL, res: NextApiResponse) {
+  response.headers.forEach((value, key) => {
+    if (key.toLowerCase() === 'content-encoding') {
+      return
+    }
+
+    if (key.toLowerCase() === 'x-goog-upload-url') {
+      res.setHeader(key, rewriteUploadUrl(value, requestUrl))
+      return
+    }
+
+    res.setHeader(key, value)
+  })
+}
+
+async function sendResponseBody(response: Response, res: NextApiResponse) {
+  if (!response.body) {
     res.end()
     return
   }
 
-  const reader = webResponse.body.getReader()
+  const reader = response.body.getReader()
 
   try {
     while (true) {
@@ -104,10 +175,43 @@ async function sendWebResponse(webResponse: Response, res: NextApiResponse) {
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method === 'OPTIONS') {
+    res.status(204).end()
+    return
+  }
+
+  const { googleUrl, requestUrl } = getGoogleUrl(req)
+  const apiKeyFromQuery = requestUrl.searchParams.get('key')
+  const apiKeyFromHeader = getHeader(req, 'x-goog-api-key')
+
+  if (!apiKeyFromQuery && !apiKeyFromHeader) {
+    res.status(401).json({ error: 'No permission' })
+    return
+  }
+
+  if (!isAllowedGeminiPath(requestUrl.pathname)) {
+    res.status(401).json({ error: 'No permission' })
+    return
+  }
+
+  const headers = new Headers()
+  appendForwardHeaders(req, headers)
+
   try {
-    const webResponse = await proxy(createWebRequest(req))
-    await sendWebResponse(webResponse, res)
-  } catch {
-    res.status(500).json({ error: 'Proxy request failed' })
+    const response = await fetch(googleUrl, {
+      method: req.method,
+      headers,
+      body: req.method === 'GET' || req.method === 'HEAD' ? undefined : req,
+      duplex: 'half',
+      redirect: 'manual',
+    } as RequestInit & { duplex: 'half' })
+
+    res.statusCode = response.status
+    res.statusMessage = response.statusText
+    sendResponseHeaders(response, requestUrl, res)
+    await sendResponseBody(response, res)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Proxy request failed'
+    res.status(500).json({ error: message })
   }
 }
