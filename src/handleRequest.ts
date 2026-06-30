@@ -12,36 +12,63 @@ import { pickHeaders } from './utils/pickHeaders'
 export async function handleRequest(context: Context) {
   const { request, logger } = context
   const { method, nextUrl, url } = request
+
   if (method === 'OPTIONS') {
     return createErrorResponse(null, 500)
   }
 
   const requestUrl = nextUrl ? nextUrl : new URL(url)
   const { pathname, searchParams } = requestUrl
-  const params = Object.fromEntries(
-    (function* () {
-      for (const item of searchParams.entries()) {
-        yield item
-      }
-    })()
-  )
+  const params = Object.fromEntries(searchParams.entries())
 
   logger.request.info(`Use ${method.toUpperCase()} to request ${pathname} with search ${JSON.stringify(params, null, 2)}`)
 
-  // The address must contain /v1 or /v1beta,
-  // otherwise it is definitely not a request to gemini,
-  // and it must contain a token,
-  // otherwise it definitely does not have permission.
   const apiKeyFromQuery = searchParams.get('key')
   const apiKeyFromHeader = request.headers.get('x-goog-api-key')
   const hasApiKey = Boolean(apiKeyFromQuery || apiKeyFromHeader)
-  
-  if (!hasApiKey || !(pathname.startsWith('/api/v1') || pathname.startsWith('/api/v1beta'))) {
+
+  const isGeminiPath =
+    pathname.startsWith('/api/v1') || pathname.startsWith('/api/v1beta')
+
+  if (!hasApiKey || !isGeminiPath) {
     return createErrorResponse('No permission', 401)
   }
 
-  // The content of the request cannot be empty.
+  const proxyPath = pathname.replace(/^\/api/, '')
+  const proxyUrl = new URL(proxyPath, GOOGLE_GEMINI_API_URL)
+
+  searchParams.delete('_path')
+  searchParams.forEach((value, key) => proxyUrl.searchParams.append(key, value))
+
+  if (!proxyUrl.searchParams.has('key') && apiKeyFromHeader) {
+    proxyUrl.searchParams.set('key', apiKeyFromHeader)
+  }
+
   const { headers: reqHeaders, body } = request
+  const headers = pickHeaders(reqHeaders, [
+    /Content\-Type/i,
+    /Content\-Length/i,
+    'x-goog-api-client',
+    'x-goog-api-key',
+  ])
+
+  const isModelsEndpoint = /^\/api\/v1(beta)?\/models\/?$/.test(pathname)
+
+  if (isModelsEndpoint && !body) {
+    logger.request.info(`Request "${requestUrl.toString()}" proxy to "${proxyUrl.toString()}".`)
+
+    const response = await fetch(proxyUrl, {
+      method,
+      headers,
+    })
+
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    })
+  }
+
   if (!body) {
     logger.request.fail('Proxy failed: body is empty.')
     return createErrorResponse('Proxy failed: body is empty.', 403)
@@ -66,42 +93,22 @@ export async function handleRequest(context: Context) {
     }
   }
 
-  /**
-   * Read the body content in advance to determine if the data inside is incorrect.
-   * Because the data is relatively strict, if an error occurs,
-   * it can be discarded to reduce requests.
-   */
   const payload = await readBody()
   const firstContnet = payload?.contents.at(0)
 
-  /**
-   * If the role of the first and last message is not `user`,
-   * the error `Please ensure that multiturn requests ends with a user role or a function response.`
-   * will occur.
-   */
   if (firstContnet?.role !== 'user') {
     payload.contents.splice(0, 1)
     logger.request.warn('First message in the payload does not have the role of "user". It has been removed.')
   }
 
-  /**
-   * The last one is the current question,
-   * it must be meaningful,
-   * otherwise it will be interrupted.
-   */
   const lastContent = payload?.contents?.at(-1)
   if (lastContent?.role !== 'user') {
     logger.response.warn('The last message in the payload does not have the role of "user".')
     return createResponse(lastContent || null)
   }
 
-  const proxyPath = pathname.replace(/^\/api/, '')
-  const proxyUrl = new URL(proxyPath, GOOGLE_GEMINI_API_URL)
-  searchParams.delete('_path')
-  searchParams.forEach((value, key) => proxyUrl.searchParams.append(key, value))
   logger.request.info(`Request "${requestUrl.toString()}" proxy to "${proxyUrl.toString()}".`)
 
-  const headers = pickHeaders(reqHeaders, [/Content\-Type/i, /Content\-Length/i, 'x-goog-api-client', 'x-goog-api-key'])
   const responseStream = new ProcessTransformStream()
   responseStream.process(({ message }) => logger.response.info(message))
 
@@ -121,12 +128,6 @@ export async function handleRequest(context: Context) {
     signal: controller.signal,
   }
 
-  /**
-   * Write the return value to the return stream.
-   * Because vercel will interrupt in the middle,
-   * so you need to return 200 first,
-   * and then wait for gemini to return the result.
-   */
   const writeResponseToWritableStream = (stream: WebWritableStream) => async (response: Response) => {
     const { status, body } = response
     const write = async (content: string) => {
@@ -168,9 +169,6 @@ export async function handleRequest(context: Context) {
           return
         }
 
-        /**
-         * @see https://github.com/vercel/next.js/issues/38736#issuecomment-1278917422
-         */
         const content = convertStringToUint8Array(value)
 
         await writer.ready
@@ -192,7 +190,6 @@ export async function handleRequest(context: Context) {
     }
   }
 
-  /** If there is an error in the middle, write the error information directly. */
   const writeErrorToWritableStream = (stream: WebWritableStream) => async (error: any) => {
     const message = error instanceof Error ? error.message : error?.toString()
     const writer = stream.getWriter()
@@ -204,6 +201,7 @@ export async function handleRequest(context: Context) {
   }
 
   logger.request.info(`Proxy request ${proxyUrl} with options ${JSON.stringify(fetchOptions, null, 2)}.`)
+
   fetch(proxyUrl, fetchOptions)
     .then(async (response) => {
       clearTimeout(timeoutId)
